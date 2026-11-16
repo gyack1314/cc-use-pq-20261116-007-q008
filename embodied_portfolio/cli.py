@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from argparse import ArgumentParser, Namespace
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 import json
@@ -15,15 +16,18 @@ def parser() -> ArgumentParser:
     main.add_argument("--db", default="portfolio.sqlite3", help="本地SQLite文件")
     commands = main.add_subparsers(dest="command", required=True)
     incoming = commands.add_parser("import")
-    incoming.add_argument("kind", choices=("offer", "requirement"))
+    incoming.add_argument("kind", choices=("offer", "requirement", "source"))
     incoming.add_argument("file")
     batch = commands.add_parser("batch")
     batch.add_argument("file")
     plan = commands.add_parser("plan")
     plan.add_argument("requirement")
+    plan.add_argument("--as-of", dest="as_of", default=None,
+                      help="评估证据时效的日期 YYYY-MM-DD，默认今天")
     approve = commands.add_parser("approve")
     approve.add_argument("analysis", type=int)
     approve.add_argument("input_digest")
+    approve.add_argument("--as-of", dest="as_of", default=None)
     analysis = commands.add_parser("analysis")
     analysis.add_argument("id", type=int)
     verify = commands.add_parser("verify")
@@ -31,10 +35,10 @@ def parser() -> ArgumentParser:
     history = commands.add_parser("history")
     history.add_argument("--requirement")
     documents = commands.add_parser("versions")
-    documents.add_argument("kind", choices=("offer", "requirement"))
+    documents.add_argument("kind", choices=("offer", "requirement", "source"))
     documents.add_argument("key")
     revisions = commands.add_parser("compare-versions")
-    revisions.add_argument("kind", choices=("offer", "requirement"))
+    revisions.add_argument("kind", choices=("offer", "requirement", "source"))
     revisions.add_argument("key")
     revisions.add_argument("earlier", type=int)
     revisions.add_argument("later", type=int)
@@ -51,6 +55,9 @@ def parser() -> ArgumentParser:
     readiness.add_argument("requirement")
     brief = commands.add_parser("brief")
     brief.add_argument("requirement")
+    sourcing = commands.add_parser("sourcing")
+    sourcing.add_argument("requirement")
+    sourcing.add_argument("--as-of", dest="as_of", default=None)
     budgets = commands.add_parser("budgets")
     budgets.add_argument("requirement")
     budgets.add_argument("amounts", nargs="+")
@@ -78,6 +85,9 @@ def parser() -> ArgumentParser:
     commands.add_parser("status")
     demo = commands.add_parser("demo")
     demo.add_argument("--workspace", default="fixtures")
+    sourcing_demo = commands.add_parser("demo-sourcing")
+    sourcing_demo.add_argument("--workspace", default="fixtures_sourcing")
+    sourcing_demo.add_argument("--as-of", dest="as_of", default="2026-11-17")
     return main
 
 
@@ -99,6 +109,51 @@ def demo_payloads() -> tuple[dict[str, Any], list[dict[str, Any]]]:
               "license": "single_customer", "allowed_clients": ["client_a"],
               "validity": "2026", "notes": "合成数据"}
     return requirement, [first, second]
+
+
+def sourcing_payloads() -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    """两家名称不同的报价商共用同一上游采集队；第三家才真正独立。
+
+    覆盖意义上 remote_01 + portable_02 已足够，但两者同源；独立保障要求引入
+    portable_03，成本上升。更正证据后才可能用更便宜的独立组合。
+    """
+    target = {"scenario": "warehouse_pick", "stage": "grasp", "outcome": "failure", "robot": "arm_a"}
+    requirement = {"key": "warehouse_trial", "client": "client_a",
+                   "title": "合成仓储抓取失败样本采购（要求双来源）",
+                   "budget": "280",
+                   "targets": [{"slice": target, "minimum": 7, "mandatory": True,
+                                "weight": "2", "minimum_independent_sources": 2}],
+                   "allowed_paths": ["teleoperation", "portable"], "maximum_packages": 3}
+    first = {"provider": "provider_a", "package": "remote_01", "path": "teleoperation",
+             "robots": ["arm_a"], "observations": [{"slice": target, "count": 5,
+                                                  "episode_ids": ["trial_1", "trial_2", "trial_3",
+                                                                  "trial_4", "trial_5"]}],
+             "hours": "1", "price_mode": "per_hour", "unit_price": "100",
+             "license": "nonexclusive", "allowed_clients": [], "validity": "2026", "notes": "合成数据"}
+    second = {"provider": "provider_b", "package": "portable_02", "path": "portable",
+              "robots": ["arm_a"], "observations": [{"slice": target, "count": 3,
+                                                   "episode_ids": ["trial_5", "trial_6", "trial_7"]}],
+              "hours": "0", "price_mode": "flat", "unit_price": "50",
+              "license": "single_customer", "allowed_clients": ["client_a"],
+              "validity": "2026", "notes": "合成数据"}
+    third = {"provider": "provider_c", "package": "portable_03", "path": "portable",
+             "robots": ["arm_a"], "observations": [{"slice": target, "count": 1,
+                                                  "episode_ids": ["trial_8"]}],
+             "hours": "0", "price_mode": "flat", "unit_price": "120",
+             "license": "nonexclusive", "allowed_clients": [], "validity": "2026",
+             "notes": "合成数据，独立采集队"}
+    evidence = {"key": "upstream_2026", "title": "上游采集队关系证据",
+                "claims": [{"package": "remote_01", "collector": "field_crew_alpha",
+                            "basis": "contract", "strength": "verified",
+                            "reference": "采购合同附件A", "observed_on": "2026-10-01"},
+                           {"package": "portable_02", "collector": "field_crew_alpha",
+                            "basis": "disclosure", "strength": "reported",
+                            "reference": "供应商书面说明", "observed_on": "2026-10-02"},
+                           {"package": "portable_03", "collector": "field_crew_beta",
+                            "basis": "audit", "strength": "verified",
+                            "reference": "现场审计记录", "observed_on": "2026-10-03"}],
+                "valid_from": "2026-10-01", "valid_until": "2027-09-30", "notes": "合成证据"}
+    return requirement, [first, second, third], [evidence]
 
 
 def demo(workspace: str) -> dict[str, Any]:
@@ -123,18 +178,75 @@ def demo(workspace: str) -> dict[str, Any]:
                 "verified": verified["verified"]}
 
 
+def demo_sourcing(workspace: str, as_of: str) -> dict[str, Any]:
+    """演示：名称分散但上游共享 → 推荐独立组合 → 更正证据后重新分析 → 旧批准快照仍可审计。"""
+    root = Path(workspace)
+    root.mkdir(parents=True, exist_ok=True)
+    requirement, offers, evidence = sourcing_payloads()
+    with PortfolioService(root / "portfolio.sqlite3") as service:
+        req = service.import_requirement(requirement)
+        for offer in offers:
+            service.import_offer(offer)
+        service.import_source(evidence[0])
+        first = service.plan(req["key"], as_of)
+        report = first["report"]
+        misleading = (report["coverage_only_source_assurance"] or {})
+        if not misleading.get("shared_source_groups"):
+            raise PortfolioError("demo_sourcing", "coverage-only choice should look diversified but share upstream")
+        approved = service.approve(first["id"], first["input_digest"])
+        if approved["state"] != "approved":
+            raise PortfolioError("demo_sourcing", "approval should record current evidence")
+        corrected = deepcopy(evidence[0])
+        corrected["claims"] = [claim for claim in corrected["claims"]
+                               if claim["package"] != "portable_02"]
+        corrected["claims"].append({"package": "portable_02", "collector": "field_crew_beta",
+                                    "basis": "audit", "strength": "verified",
+                                    "reference": "更正后的审计记录", "observed_on": "2026-11-16"})
+        service.import_source(corrected)
+        second = service.plan(req["key"], as_of)
+        history = service.audit_analysis(approved["id"])
+        if not history["historical_valid"]:
+            raise PortfolioError("demo_audit", "approved snapshot should stay auditable")
+        if history["evidence_current"]:
+            raise PortfolioError("demo_audit", "old approval must not claim current evidence")
+        if not service.audit_analysis(second["id"])["evidence_current"]:
+            raise PortfolioError("demo_audit", "new analysis should bind corrected evidence")
+        return {"first_analysis": first["id"], "first_selection": report["selection"],
+                "first_cost": report["cost"],
+                "first_assurance_met": report["source_assurance"]["assurance_met"],
+                "coverage_only_selection": report["coverage_only_selection"],
+                "coverage_only_cost": report["coverage_only_cost"],
+                "coverage_only_assurance_met":
+                    report["coverage_only_source_assurance"]["assurance_met"],
+                "coverage_only_shared_upstream":
+                    report["coverage_only_source_assurance"]["shared_source_groups"],
+                "provider_diversity_misleading":
+                    report["coverage_only_source_assurance"]["provider_diversity_misleading"],
+                "independent_alternative": report["independent_alternative"],
+                "assurance_premium": report["assurance_premium"],
+                "second_analysis": second["id"], "second_selection": second["report"]["selection"],
+                "second_cost": second["report"]["cost"],
+                "second_assurance_met": second["report"]["source_assurance"]["assurance_met"],
+                "old_approval_still_valid": history["historical_valid"],
+                "old_approval_evidence_current": history["evidence_current"],
+                "second_evidence_current": service.audit_analysis(second["id"])["evidence_current"],
+                "old_approval_selection": approved["report"]["selection"]}
+
+
 def execute(args: Namespace) -> Any:
     if args.command == "demo":
         return demo(args.workspace)
+    if args.command == "demo-sourcing":
+        return demo_sourcing(args.workspace, args.as_of)
     with PortfolioService(args.db) as service:
         if args.command == "import":
             return service.import_file(args.kind, args.file)
         if args.command == "batch":
             return service.import_batch_file(args.file)
         if args.command == "plan":
-            return service.plan(args.requirement)
+            return service.plan(args.requirement, args.as_of)
         if args.command == "approve":
-            return service.approve(args.analysis, args.input_digest)
+            return service.approve(args.analysis, args.input_digest, args.as_of)
         if args.command == "analysis":
             return service.analysis(args.id)
         if args.command == "verify":
@@ -155,6 +267,8 @@ def execute(args: Namespace) -> Any:
             return service.readiness(args.requirement)
         if args.command == "brief":
             return service.brief(args.requirement)
+        if args.command == "sourcing":
+            return service.sourcing(args.requirement, args.as_of)
         if args.command == "budgets":
             return service.budget_grid(args.requirement, args.amounts)
         if args.command == "targets":

@@ -21,7 +21,7 @@ CREATE INDEX IF NOT EXISTS document_lookup ON documents(kind,key,revision DESC);
 CREATE TABLE IF NOT EXISTS analyses (
   id INTEGER PRIMARY KEY, requirement_key TEXT NOT NULL, requirement_revision INTEGER NOT NULL,
   input_digest TEXT NOT NULL, state TEXT NOT NULL, report TEXT NOT NULL, report_digest TEXT NOT NULL,
-  created_at TEXT NOT NULL, approved_at TEXT);
+  created_at TEXT NOT NULL, approved_at TEXT, as_of TEXT);
 CREATE INDEX IF NOT EXISTS analyses_by_requirement ON analyses(requirement_key,id DESC);
 CREATE TABLE IF NOT EXISTS analysis_inputs (
   analysis_id INTEGER NOT NULL, document_id INTEGER NOT NULL,
@@ -50,6 +50,9 @@ class Ledger:
         self.db.execute("PRAGMA busy_timeout=20000")
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
+        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(analyses)")}
+        if "as_of" not in columns:
+            self.db.execute("ALTER TABLE analyses ADD COLUMN as_of TEXT")
 
     def close(self):
         self.db.close()
@@ -123,7 +126,7 @@ class Ledger:
         identities = [(kind, key) for kind, key, _ in entries]
         if len(set(identities)) != len(identities):
             raise PortfolioError("duplicate_batch_key", "batch repeats a document key")
-        if any(kind not in {"offer", "requirement"} for kind, _, _ in entries):
+        if any(kind not in {"offer", "requirement", "source"} for kind, _, _ in entries):
             raise PortfolioError("document_kind", "batch contains unknown document kind")
         results = []
         with self.transaction():
@@ -158,24 +161,32 @@ class Ledger:
         return [{**dict(row), "report": json.loads(row["report"])} for row in rows]
 
     def insert_analysis(self, requirement: dict[str, Any], offer_docs: list[dict[str, Any]],
-                        report: dict[str, Any]) -> dict[str, Any]:
-        input_refs = [(item["id"], item["digest"]) for item in [requirement, *offer_docs]]
+                        report: dict[str, Any], evidence_docs: list[dict[str, Any]] | None = None,
+                        as_of: str | None = None) -> dict[str, Any]:
+        evidence_docs = evidence_docs or []
+        # 输入指纹按固定顺序（需求、报价、证据，各自按 key）计算，verify 才能稳定复算。
+        inputs = [requirement, *sorted(offer_docs, key=lambda doc: doc["key"]),
+                  *sorted(evidence_docs, key=lambda doc: doc["key"])]
+        input_refs = [(item["id"], item["digest"]) for item in inputs]
         input_hash = digest(input_refs)
         report_hash = digest(report)
         with self.transaction():
-            cursor = self.db.execute("INSERT INTO analyses(requirement_key,requirement_revision,input_digest,state,report,report_digest,created_at) "
-                                     "VALUES(?,?,?,?,?,?,?)", (requirement["key"], requirement["revision"],
-                                     input_hash, "draft", canonical(report), report_hash, timestamp()))
+            cursor = self.db.execute("INSERT INTO analyses(requirement_key,requirement_revision,input_digest,state,report,report_digest,created_at,as_of) "
+                                     "VALUES(?,?,?,?,?,?,?,?)", (requirement["key"], requirement["revision"],
+                                     input_hash, "draft", canonical(report), report_hash, timestamp(), as_of))
             analysis_id = cursor.lastrowid
             self.db.executemany("INSERT INTO analysis_inputs VALUES(?,?)",
                                 [(analysis_id, doc_id) for doc_id, _ in input_refs])
             self.event("analyze", f"analysis:{analysis_id}", {"input_digest": input_hash,
-                       "report_digest": report_hash})
+                       "report_digest": report_hash, "as_of": as_of,
+                       "evidence_documents": [doc["id"] for doc in evidence_docs]})
             return self.analysis(analysis_id)
+
+    INPUT_ORDER = "CASE d.kind WHEN 'requirement' THEN 0 WHEN 'offer' THEN 1 WHEN 'source' THEN 2 ELSE 3 END, d.key"
 
     def analysis_inputs(self, analysis_id: int) -> list[dict[str, Any]]:
         rows = self.db.execute("SELECT d.* FROM documents d JOIN analysis_inputs a ON a.document_id=d.id "
-                               "WHERE a.analysis_id=? ORDER BY CASE d.kind WHEN 'requirement' THEN 0 ELSE 1 END,d.key", (analysis_id,))
+                               f"WHERE a.analysis_id=? ORDER BY {self.INPUT_ORDER}", (analysis_id,))
         return [self._document(row) for row in rows]
 
     def latest_input_digest(self, requirement_key: str) -> str:
@@ -183,7 +194,9 @@ class Ledger:
         if not requirement:
             raise PortfolioError("missing_requirement", "requirement not found")
         offers = self.documents("offer")
-        return digest([(doc["id"], doc["digest"]) for doc in [requirement, *offers]])
+        evidence = self.documents("source")
+        return digest([(doc["id"], doc["digest"])
+                       for doc in [requirement, *offers, *evidence]])
 
     def approve(self, analysis_id: int, expected_input_digest: str) -> dict[str, Any]:
         with self.transaction():

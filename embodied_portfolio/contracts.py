@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
+from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any
 import json
@@ -56,6 +57,18 @@ def identifiers(value: Any, name: str, *, empty: bool = False) -> tuple[str, ...
     return results
 
 
+def iso_date(value: Any, name: str) -> str:
+    if not isinstance(value, str) or len(value) != 10:
+        raise PortfolioError("invalid_date", f"{name} must be YYYY-MM-DD")
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError:
+        raise PortfolioError("invalid_date", f"{name} must be YYYY-MM-DD") from None
+    if parsed.isoformat() != value:
+        raise PortfolioError("invalid_date", f"{name} must be YYYY-MM-DD")
+    return value
+
+
 def canonical(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
@@ -64,6 +77,8 @@ PATHS = {"teleoperation", "simulation", "portable", "internet"}
 OUTCOMES = {"success", "failure", "intervention"}
 PRICING = {"per_record", "per_hour", "flat"}
 LICENSES = {"nonexclusive", "single_customer", "restricted"}
+EVIDENCE_BASIS = {"contract", "invoice", "audit", "interview", "disclosure"}
+EVIDENCE_STRENGTH = {"verified", "reported"}
 
 
 @dataclass(frozen=True)
@@ -183,6 +198,7 @@ class Target:
     minimum: int
     mandatory: bool
     weight: str
+    minimum_independent_sources: int = 0
 
     @classmethod
     def parse(cls, value: Any) -> "Target":
@@ -193,11 +209,14 @@ class Target:
         if type(mandatory) is not bool:
             raise PortfolioError("target_mandatory", "mandatory must be boolean")
         weight = decimal(value.get("weight", 1), "weight", positive=True)
-        return cls(Slice.parse(value.get("slice")), minimum, mandatory, str(weight))
+        sources = count(value.get("minimum_independent_sources", 0),
+                        "minimum_independent_sources", maximum=100)
+        return cls(Slice.parse(value.get("slice")), minimum, mandatory, str(weight), sources)
 
     def document(self) -> dict[str, Any]:
         return {"slice": asdict(self.slice), "minimum": self.minimum,
-                "mandatory": self.mandatory, "weight": self.weight}
+                "mandatory": self.mandatory, "weight": self.weight,
+                "minimum_independent_sources": self.minimum_independent_sources}
 
 
 @dataclass(frozen=True)
@@ -236,9 +255,79 @@ class Requirement:
                 "allowed_paths": list(self.allowed_paths), "maximum_packages": self.maximum_packages}
 
 
-def parse_document(kind: str, value: Any) -> Offer | Requirement:
+@dataclass(frozen=True)
+class SourceClaim:
+    package: str
+    collector: str
+    basis: str
+    strength: str
+    reference: str
+    observed_on: str
+
+    @classmethod
+    def parse(cls, value: Any) -> "SourceClaim":
+        if not isinstance(value, dict):
+            raise PortfolioError("claim_shape", "source claim must be an object")
+        basis = value.get("basis")
+        if basis not in EVIDENCE_BASIS:
+            raise PortfolioError("evidence_basis", "unknown evidence basis")
+        strength = value.get("strength")
+        if strength not in EVIDENCE_STRENGTH:
+            raise PortfolioError("evidence_strength", "strength must be verified or reported")
+        return cls(key(value.get("package"), "claim package"), key(value.get("collector"), "collector"),
+                   basis, strength, text(value.get("reference"), "claim reference", 80),
+                   iso_date(value.get("observed_on"), "observed_on"))
+
+    def document(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class SourceEvidence:
+    """一份带有效期的上游采集关系证据。修订会取代旧修订，但旧分析仍绑定旧修订。"""
+
+    key: str
+    title: str
+    claims: tuple[SourceClaim, ...]
+    valid_from: str
+    valid_until: str
+    notes: str
+
+    @classmethod
+    def parse(cls, value: Any) -> "SourceEvidence":
+        if not isinstance(value, dict):
+            raise PortfolioError("source_shape", "source evidence must be an object")
+        raw_claims = value.get("claims")
+        if not isinstance(raw_claims, list) or not raw_claims:
+            raise PortfolioError("claims", "source evidence needs claims")
+        claims = tuple(sorted((SourceClaim.parse(item) for item in raw_claims),
+                              key=lambda claim: (claim.package, claim.collector)))
+        if len({(claim.package, claim.collector) for claim in claims}) != len(claims):
+            raise PortfolioError("duplicate_claim", "source claim repeats package and collector")
+        valid_from = iso_date(value.get("valid_from"), "valid_from")
+        valid_until = iso_date(value.get("valid_until"), "valid_until")
+        if valid_from > valid_until:
+            raise PortfolioError("validity_window", "valid_from must not follow valid_until")
+        notes = value.get("notes", "")
+        if not isinstance(notes, str) or len(notes) > 500:
+            raise PortfolioError("notes", "notes must be short text")
+        return cls(key(value.get("key"), "source key"), text(value.get("title"), "source title"),
+                   claims, valid_from, valid_until, notes)
+
+    def document(self) -> dict[str, Any]:
+        return {"key": self.key, "title": self.title,
+                "claims": [claim.document() for claim in self.claims],
+                "valid_from": self.valid_from, "valid_until": self.valid_until, "notes": self.notes}
+
+    def claims_for(self, package: str) -> tuple[SourceClaim, ...]:
+        return tuple(claim for claim in self.claims if claim.package == package)
+
+
+def parse_document(kind: str, value: Any) -> Offer | Requirement | SourceEvidence:
     if kind == "offer":
         return Offer.parse(value)
     if kind == "requirement":
         return Requirement.parse(value)
-    raise PortfolioError("document_kind", "kind must be offer or requirement")
+    if kind == "source":
+        return SourceEvidence.parse(value)
+    raise PortfolioError("document_kind", "kind must be offer, requirement or source")

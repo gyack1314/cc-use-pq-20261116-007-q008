@@ -8,6 +8,7 @@ from .contracts import Offer, Requirement, Target, PortfolioError, decimal
 from .coverage import CoverageEngine
 from .economics import PriceEngine, money
 from .optimizer import PortfolioOptimizer
+from .sourcing import SourceContext
 
 
 class SensitivityAnalyzer:
@@ -16,14 +17,15 @@ class SensitivityAnalyzer:
         self.coverage = coverage
         self.prices = prices
 
-    def budget_grid(self, requirement: Requirement, offers: list[Offer], budgets: list[str]) -> list[dict[str, Any]]:
+    def budget_grid(self, requirement: Requirement, offers: list[Offer], budgets: list[str],
+                    context: SourceContext | None = None) -> list[dict[str, Any]]:
         if not budgets or len(budgets) > 20:
             raise PortfolioError("grid_size", "budget grid requires 1-20 points")
         results = []
         for raw in budgets:
             budget = decimal(raw, "budget", nonnegative=True)
             variant = replace(requirement, budget=str(budget))
-            search = self.optimizer.search(variant, offers)
+            search = self.optimizer.search(variant, offers, context)
             results.append({"budget": money(budget), "feasible": search.best is not None,
                             "selected": list(search.best.packages) if search.best else [],
                             "cost": search.best.cost if search.best else None,
@@ -31,7 +33,8 @@ class SensitivityAnalyzer:
         return results
 
     def target_grid(self, requirement: Requirement, offers: list[Offer],
-                    target_token: str, minimums: list[int]) -> list[dict[str, Any]]:
+                    target_token: str, minimums: list[int],
+                    context: SourceContext | None = None) -> list[dict[str, Any]]:
         if not minimums or len(minimums) > 20:
             raise PortfolioError("grid_size", "target grid requires 1-20 points")
         targets = list(requirement.targets)
@@ -46,18 +49,19 @@ class SensitivityAnalyzer:
             revised = list(targets)
             revised[target_index] = replace(revised[target_index], minimum=minimum)
             variant = replace(requirement, targets=tuple(revised))
-            search = self.optimizer.search(variant, offers)
+            search = self.optimizer.search(variant, offers, context)
             results.append({"minimum": minimum, "feasible": search.best is not None,
                             "selected": list(search.best.packages) if search.best else [],
                             "cost": search.best.cost if search.best else None,
                             "reason": search.reason})
         return results
 
-    def remove_offer(self, requirement: Requirement, offers: list[Offer], package: str) -> dict[str, Any]:
+    def remove_offer(self, requirement: Requirement, offers: list[Offer], package: str,
+                     context: SourceContext | None = None) -> dict[str, Any]:
         if package not in {offer.package for offer in offers}:
             raise PortfolioError("unknown_offer", "offer not in catalog")
-        baseline = self.optimizer.search(requirement, offers)
-        alternative = self.optimizer.search(requirement, [offer for offer in offers if offer.package != package])
+        baseline = self.optimizer.search(requirement, offers, context)
+        alternative = self.optimizer.search(requirement, [offer for offer in offers if offer.package != package], context)
         return {"removed": package,
                 "before_selection": list(baseline.best.packages) if baseline.best else [],
                 "before_cost": baseline.best.cost if baseline.best else None,
@@ -67,14 +71,15 @@ class SensitivityAnalyzer:
                 "reason": alternative.reason}
 
     def price_change(self, requirement: Requirement, offers: list[Offer],
-                     package: str, unit_price: str) -> dict[str, Any]:
+                     package: str, unit_price: str,
+                     context: SourceContext | None = None) -> dict[str, Any]:
         if package not in {offer.package for offer in offers}:
             raise PortfolioError("unknown_offer", "offer not in catalog")
         revised_price = decimal(unit_price, "unit_price", nonnegative=True)
-        baseline = self.optimizer.search(requirement, offers)
+        baseline = self.optimizer.search(requirement, offers, context)
         revised = [replace(offer, unit_price=str(revised_price)) if offer.package == package else offer
                    for offer in offers]
-        changed = self.optimizer.search(requirement, revised)
+        changed = self.optimizer.search(requirement, revised, context)
         return {"package": package, "new_unit_price": str(revised_price),
                 "before_selection": list(baseline.best.packages) if baseline.best else [],
                 "after_selection": list(changed.best.packages) if changed.best else [],
@@ -82,8 +87,10 @@ class SensitivityAnalyzer:
                 "after_cost": changed.best.cost if changed.best else None,
                 "after_feasible": changed.best is not None}
 
-    def leave_one_out(self, requirement: Requirement, offers: list[Offer]) -> list[dict[str, Any]]:
-        baseline = self.optimizer.search(requirement, offers)
+    def leave_one_out(self, requirement: Requirement, offers: list[Offer],
+                       context: SourceContext | None = None) -> list[dict[str, Any]]:
+        baseline = self.optimizer.search(requirement, offers, context)
         if baseline.best is None:
             return []
-        return [self.remove_offer(requirement, offers, package) for package in baseline.best.packages]
+        return [self.remove_offer(requirement, offers, package, context)
+                for package in baseline.best.packages]

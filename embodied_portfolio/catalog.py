@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 import json
 
-from .contracts import Offer, Requirement, PortfolioError, parse_document
+from .contracts import Offer, Requirement, SourceEvidence, PortfolioError, parse_document
 from .ledger import Ledger
 
 
@@ -33,13 +33,19 @@ class Catalog:
         requirement = Requirement.parse(value)
         return self.ledger.insert_document("requirement", requirement.key, requirement.document())
 
+    def import_source(self, value: dict[str, Any]) -> dict[str, Any]:
+        evidence = SourceEvidence.parse(value)
+        return self.ledger.insert_document("source", evidence.key, evidence.document())
+
     def import_file(self, kind: str, path: str | Path) -> dict[str, Any]:
         value = read_json(path)
         if kind == "offer":
             return self.import_offer(value)
         if kind == "requirement":
             return self.import_requirement(value)
-        raise PortfolioError("document_kind", "kind must be offer or requirement")
+        if kind == "source":
+            return self.import_source(value)
+        raise PortfolioError("document_kind", "kind must be offer, requirement or source")
 
     def import_batch(self, value: dict[str, Any]) -> dict[str, Any]:
         """整批校验完成后才写入任何修订。"""
@@ -55,7 +61,12 @@ class Catalog:
             kind = item.get("kind")
             parsed = parse_document(kind, item["body"])
             document = parsed.document()
-            identity = parsed.package if isinstance(parsed, Offer) else parsed.key
+            if isinstance(parsed, Offer):
+                identity = parsed.package
+            elif isinstance(parsed, Requirement):
+                identity = parsed.key
+            else:
+                identity = parsed.key
             entries.append((kind, identity, document))
         imported = self.ledger.insert_documents(entries)
         return {"count": len(imported), "changed": sum(doc["changed"] for doc in imported),
@@ -69,6 +80,9 @@ class Catalog:
     def offers(self) -> list[tuple[dict[str, Any], Offer]]:
         return [(doc, Offer.parse(doc["body"])) for doc in self.ledger.documents("offer")]
 
+    def sources(self) -> list[tuple[dict[str, Any], SourceEvidence]]:
+        return [(doc, SourceEvidence.parse(doc["body"])) for doc in self.ledger.documents("source")]
+
     def requirement(self, key: str) -> tuple[dict[str, Any], Requirement]:
         doc = self.ledger.latest_document("requirement", key)
         if not doc:
@@ -76,16 +90,19 @@ class Catalog:
         return doc, Requirement.parse(doc["body"])
 
     def history(self, kind: str, key: str) -> list[dict[str, Any]]:
-        if kind not in {"offer", "requirement"}:
+        if kind not in {"offer", "requirement", "source"}:
             raise PortfolioError("document_kind", "unknown document kind")
         return [doc for doc in self.ledger.documents(kind, latest=False) if doc["key"] == key]
 
     def summary(self) -> dict[str, Any]:
         offers = self.ledger.documents("offer")
         requirements = self.ledger.documents("requirement")
+        sources = self.ledger.documents("source")
         return {"offer_count": len(offers), "requirement_count": len(requirements),
+                "source_count": len(sources),
                 "offer_versions": sum(len(self.history("offer", item["key"])) for item in offers),
-                "requirement_versions": sum(len(self.history("requirement", item["key"])) for item in requirements)}
+                "requirement_versions": sum(len(self.history("requirement", item["key"])) for item in requirements),
+                "source_versions": sum(len(self.history("source", item["key"])) for item in sources)}
 
     def compare_versions(self, kind: str, key: str, earlier: int, later: int) -> dict[str, Any]:
         if earlier == later or earlier < 1 or later < 1:
